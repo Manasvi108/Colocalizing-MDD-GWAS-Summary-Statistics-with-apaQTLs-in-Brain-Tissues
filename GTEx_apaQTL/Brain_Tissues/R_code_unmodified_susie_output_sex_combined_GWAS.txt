@@ -1,0 +1,218 @@
+# Load necessary libraries
+library(susieR)
+library(coloc)
+library(data.table)
+
+# ==========================================
+# 1. DEFINE YOUR FILES & TARGETS
+# ==========================================
+gwas_file      <- "male_GWAS_common_SNPs_2Mb\\rs17782683_2mb_GWAS_SNPs.tsv"
+qtl_file       <- "male_GWAS_common_SNPs_apaQTLs_2Mb\\rs17782683_2mb_Brain_Hypothalamus_apaQTL.tsv"
+ld_matrix_file <- "LD_matrices_male_GWAS_common_SNPs\\rs17782683_LD_matrix.unphased.vcor1"
+ld_snps_file   <- "LD_matrices_male_GWAS_common_SNPs\\rs17782683_LD_matrix.unphased.vcor1.vars"
+
+# Sample sizes 
+N_gwas <- 3887532 
+N_qtl  <- 256
+
+# ---> Paste your specific APA events of interest here <---
+# You can add as many as you want. Wrap each in quotes and separate by commas.
+target_apa_events <- c("ENSG00000119725.21_chr14:73909341-73909605" , "ENSG00000170345.10_chr14:75279877-75280374")
+
+print("Loading data...")
+gwas    <- fread(gwas_file)
+qtl_raw <- fread(qtl_file)
+
+R_matrix <- as.matrix(fread(ld_matrix_file))
+ld_snps  <- fread(ld_snps_file, header = FALSE)$V1
+rownames(R_matrix) <- ld_snps
+colnames(R_matrix) <- ld_snps
+
+# ==========================================
+# 2. PRE-PROCESSING
+# ==========================================
+print("Standardizing IDs and calculating base Z-scores...")
+
+# Create chr_pos using the new explicit columns
+gwas$chr_pos    <- paste(gwas$chromosome, gwas$base_pair_location, sep = "_")
+qtl_raw$chr_pos <- sub("^chr([0-9]+)_([0-9]+)_.*", "\\1_\\2", qtl_raw$variant_id)
+
+# Standardize the rsid column name so the rest of the loop doesn't break
+gwas$rs_id <- gwas$rsid 
+
+qtl_raw$rs_id <- gwas$rs_id[match(qtl_raw$chr_pos, gwas$chr_pos)]
+
+# Calculate Z-scores
+gwas$Z_score    <- gwas$beta / gwas$standard_error
+qtl_raw$Z_score <- qtl_raw$slope / qtl_raw$slope_se
+
+# ==========================================
+# 3. THE ALLELE HARMONIZER
+# ==========================================
+print("--- HARMONIZATION AUDIT ---")
+initial_qtl <- nrow(qtl_raw)
+print(paste("Initial apaQTL variants:", initial_qtl))
+
+# Map the dedicated allele columns directly
+gwas$ref <- gwas$other_allele
+gwas$alt <- gwas$effect_allele
+
+# QTL still needs to be extracted from its variant_id
+qtl_raw$ref <- tstrsplit(qtl_raw$variant_id, "_")[[3]]
+qtl_raw$alt <- tstrsplit(qtl_raw$variant_id, "_")[[4]]
+
+# Transfer GWAS alleles to the QTL dataframe for side-by-side comparison
+qtl_raw$gwas_ref <- gwas$ref[match(qtl_raw$chr_pos, gwas$chr_pos)]
+qtl_raw$gwas_alt <- gwas$alt[match(qtl_raw$chr_pos, gwas$chr_pos)]
+
+# TRACKER 1: Drop variants not found in GWAS
+qtl_raw <- qtl_raw[!is.na(qtl_raw$gwas_ref), ]
+drop_1 <- initial_qtl - nrow(qtl_raw)
+print(paste("Dropped [", drop_1, "] variants: No coordinate match in GWAS."))
+
+# Categorize alignments
+perfect_match <- (qtl_raw$ref == qtl_raw$gwas_ref) & (qtl_raw$alt == qtl_raw$gwas_alt)
+flipped_match <- (qtl_raw$ref == qtl_raw$gwas_alt) & (qtl_raw$alt == qtl_raw$gwas_ref)
+
+# Flip the mathematically backward Z-scores
+qtl_raw$Z_score[flipped_match] <- qtl_raw$Z_score[flipped_match] * -1
+
+# TRACKER 2: Drop unresolvable multiallelic variants (e.g., A/T vs C/G)
+invalid_alleles <- !(perfect_match | flipped_match)
+drop_2 <- sum(invalid_alleles)
+qtl_raw <- qtl_raw[!invalid_alleles, ]
+print(paste("Dropped [", drop_2, "] variants: Unresolvable allele mismatch."))
+
+# ==========================================
+# 4. LOOP THROUGH TARGET APA EVENTS
+# ==========================================
+available_events <- unique(qtl_raw$phenotype_id)
+valid_targets    <- intersect(target_apa_events, available_events)
+missing_events   <- setdiff(target_apa_events, available_events)
+
+if (length(missing_events) > 0) {
+  print(paste("WARNING: Skipping", length(missing_events), "requested event(s) not found in the loaded QTL data."))
+}
+
+if (length(valid_targets) == 0) {
+  stop("FATAL ERROR: None of your pasted target events were found in the QTL file. Halting script.")
+}
+
+print(paste("Found", length(valid_targets), "valid target APA event(s). Starting loop..."))
+
+coloc_summary_list <- list() 
+
+for (target_event in valid_targets) {
+  
+  cat(sprintf("\n>>> Analyzing: %s <<<\n", target_event))
+  flush.console() 
+  
+  qtl_sub <- qtl_raw[qtl_raw$phenotype_id == target_event, ]
+  initial_loop_snps <- nrow(qtl_sub)
+  
+  # TRACKER 3: The 3-way Intersection
+  common_snps <- intersect(intersect(gwas$rs_id, qtl_sub$rs_id), ld_snps)
+  drop_3 <- initial_loop_snps - length(common_snps)
+  print(paste("  -> Dropped [", drop_3, "] variants: Not present across GWAS, QTL, and LD matrix."))
+  
+  if(length(common_snps) == 0) {
+    print("  -> SKIPPING: 0 overlapping SNPs remain.")
+    next
+  }
+  
+  g_sub <- gwas[match(common_snps, gwas$rs_id), ]
+  q_sub <- qtl_sub[match(common_snps, qtl_sub$rs_id), ]
+  R_sub <- R_matrix[common_snps, common_snps]
+  
+  z_g <- g_sub$Z_score
+  z_q <- q_sub$Z_score
+  
+  # TRACKER 4: The Data Sanitizer
+  safe_snps <- !is.na(z_g) & !is.infinite(z_g) & abs(z_g) < 50 &
+               !is.na(z_q) & !is.infinite(z_q) & abs(z_q) < 50 &
+               complete.cases(R_sub)
+               
+  drop_4 <- sum(!safe_snps)
+  print(paste("  -> Dropped [", drop_4, "] variants: NA/Inf/Missing in LD"))
+  
+  z_g_clean <- z_g[safe_snps]
+  z_q_clean <- z_q[safe_snps]
+  R_clean   <- R_sub[safe_snps, safe_snps]
+  
+  names(z_g_clean) <- g_sub$rs_id[safe_snps]
+  names(z_q_clean) <- q_sub$rs_id[safe_snps]
+  
+  final_snp_count <- sum(safe_snps)
+  print(paste("  -> FINAL SNPs running in SuSiE: [", final_snp_count, "]"))
+  
+  if(final_snp_count < 10) {
+    print("  -> SKIPPING: Too few valid SNPs to run mathematical models.")
+    next
+  }
+  
+  # Matrix Stabilizer
+  diag(R_clean) <- 1
+  R_stable <- R_clean + diag(1e-4, nrow(R_clean))
+  R_stable <- cov2cor(R_stable)
+  
+  # F. RUN SUSIE
+  tryCatch({
+    
+    susie_gwas <- suppressWarnings(susie_rss(z = z_g_clean, R = R_stable, n = N_gwas, 
+                            L = 10,  
+                            estimate_residual_variance = FALSE,
+                            estimate_prior_variance = FALSE))
+                            
+    susie_qtl  <- suppressWarnings(susie_rss(z = z_q_clean, R = R_stable, n = N_qtl,  
+                            L = 10,  
+                            estimate_residual_variance = FALSE,
+                            estimate_prior_variance = FALSE))
+    
+    res <- coloc.susie(susie_gwas, susie_qtl)
+    
+    if (!is.null(res$summary)) {
+      
+      sum_res <- as.data.frame(res$summary) 
+      sum_res$APA_Event <- target_event
+      
+      for(i in 1:nrow(sum_res)) {
+        cat(sprintf("  -> GWAS Lead: %s | QTL Lead: %s | PP.H3: %.3f | PP.H4: %.3f\n", 
+                    sum_res$hit1[i], sum_res$hit2[i], sum_res$PP.H3.abf[i], sum_res$PP.H4.abf[i]))
+      }
+      
+      coloc_summary_list[[target_event]] <- sum_res
+      
+    } else {
+      print("  -> Coloc returned NULL: No signal detected.")
+    }
+    
+  }, error = function(e) {
+    print(paste("  -> ERROR: SuSiE crashed -", e$message))
+  })
+  
+}
+
+# ==========================================
+# 5. FINAL OUTPUT
+# ==========================================
+print("\n=== COLOCALIZATION COMPLETE ===")
+
+if(length(coloc_summary_list) > 0) {
+  
+  final_summary_table <- as.data.frame(rbindlist(coloc_summary_list, fill = TRUE))
+  
+  col_order <- c("APA_Event", setdiff(names(final_summary_table), "APA_Event"))
+  final_summary_table <- final_summary_table[, col_order, drop = FALSE]
+  final_summary_table <- final_summary_table[order(-final_summary_table$PP.H4.abf), , drop = FALSE]
+  
+  rownames(final_summary_table) <- NULL
+  
+  cat("\n==================\n")
+  cat("COLOC SUMMARY :\n")
+  cat("==================\n\n")
+  
+  write.table(final_summary_table, file = "", sep = "\t", row.names = FALSE, quote = FALSE)
+  
+} else {
+  print("No valid colocalization signals were found across any evaluated target events.")
+}

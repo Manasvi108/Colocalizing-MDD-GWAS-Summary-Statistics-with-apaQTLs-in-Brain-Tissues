@@ -1,0 +1,6 @@
+Brain_Amygdala            | N = 180
+Brain_Cortex              | N = 268
+Brain_Frontal_Cortex_BA9  | N = 268
+Brain_Hippocampus         | N = 254
+Brain_Hypothalamus        | N = 256
+Brain_Substantia_nigra    | N = 183

@@ -1,0 +1,8 @@
+The difference between the summary statistics of the sex-combined and sex-stratified GWAS : 
+1. sex-stratified GWAS has the variant_id column, whereas sex-combined GWAS does not.
+2. sex-combined GWAS has a separate column, base_pair_location, unlike the sex-stratified GWAS, where one has to obtain the base pair location from the variant_id column.
+
+The 'R_code_unmodified_susie_output' code prints the probablities of the 4 hypothesis for each snp in the credible set. One needs to enter the phenotype id, that is the APA event.
+Run this code after the 'R_code', once you know the phenotypes which have susie hits.
+
+Make sure to change the 'N_qtl' according to the tissue sample size. The sample size for each tissue was obtained from the covariates file for that tissue. (number of columns-1)
